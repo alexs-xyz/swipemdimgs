@@ -19,6 +19,17 @@ MARKDOWN_IMAGE_RE = re.compile(
 KEEP = "keep"
 REMOVE = "remove"
 FLASH_MS = 110
+APP_ID = "io.github.alexs.swipemdimgs"
+APP_NAME = "swipemdimgs"
+WINDOW_WIDTH_FRACTION = 0.82
+WINDOW_HEIGHT_FRACTION = 0.82
+WINDOW_MAX_WIDTH = 1100
+WINDOW_MAX_HEIGHT = 760
+WINDOW_MIN_WIDTH = 640
+WINDOW_MIN_HEIGHT = 420
+WINDOW_SAFE_MARGIN = 24
+IMAGE_HORIZONTAL_MARGIN = 40
+IMAGE_VERTICAL_MARGIN = 130
 
 
 @dataclass(frozen=True)
@@ -204,26 +215,29 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
         gi.require_version("Gtk", "3.0")
         gi.require_version("Gdk", "3.0")
         gi.require_version("GdkPixbuf", "2.0")
-        from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+        from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
     except (ImportError, ValueError) as exc:
         print("swipemdimgs needs GTK 3, PyGObject, and GdkPixbuf installed.", file=sys.stderr)
         print(f"import error: {exc}", file=sys.stderr)
         return 1
 
-    if Gdk.Display.get_default() is None:
-        print("no graphical display is available for the review window", file=sys.stderr)
-        return 1
+    GLib.set_application_name(APP_NAME)
+    GLib.set_prgname(APP_ID)
 
     class SwipeWindow:
-        def __init__(self) -> None:
+        def __init__(self, application: Gtk.Application) -> None:
             self.decisions: list[str | None] = [None] * len(refs)
             self.current = 0
             self.waiting = False
             self.finished = False
             self.exit_code = 0
 
-            self.window = Gtk.Window(title=f"swipemdimgs - {markdown_file.name}")
-            self.window.set_default_size(1100, 780)
+            self.window = Gtk.ApplicationWindow(
+                application=application,
+                title=f"swipemdimgs - {markdown_file.name}",
+            )
+            default_width, default_height = self.default_window_size()
+            self.window.set_default_size(default_width, default_height)
             self.window.connect("destroy", self.quit)
             self.window.connect("key-press-event", self.on_key_press)
 
@@ -271,10 +285,10 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
             self.buttons.pack_start(button, False, False, 0)
             return button
 
-        def max_image_size(self) -> tuple[int, int]:
+        def active_workarea(self) -> object | None:
             display = Gdk.Display.get_default()
             if display is None or display.get_n_monitors() == 0:
-                return 1000, 650
+                return None
 
             window = self.window.get_window()
             monitor = display.get_monitor_at_window(window) if window else None
@@ -283,8 +297,51 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
             if monitor is None:
                 monitor = display.get_monitor(0)
 
-            workarea = monitor.get_workarea()
-            return max(320, int(workarea.width * 0.82)), max(240, int(workarea.height * 0.70))
+            return monitor.get_workarea()
+
+        def bounded_window_side(
+            self,
+            workarea_side: int,
+            fraction: float,
+            max_side: int,
+            min_side: int,
+        ) -> int:
+            safe_side = max(1, workarea_side - WINDOW_SAFE_MARGIN)
+            target = min(max_side, int(workarea_side * fraction), safe_side)
+            if safe_side >= min_side:
+                target = max(min_side, target)
+            return target
+
+        def default_window_size(self) -> tuple[int, int]:
+            workarea = self.active_workarea()
+            if workarea is None:
+                return 900, 620
+            return (
+                self.bounded_window_side(
+                    workarea.width,
+                    WINDOW_WIDTH_FRACTION,
+                    WINDOW_MAX_WIDTH,
+                    WINDOW_MIN_WIDTH,
+                ),
+                self.bounded_window_side(
+                    workarea.height,
+                    WINDOW_HEIGHT_FRACTION,
+                    WINDOW_MAX_HEIGHT,
+                    WINDOW_MIN_HEIGHT,
+                ),
+            )
+
+        def max_image_size(self) -> tuple[int, int]:
+            image_width = self.image.get_allocated_width()
+            image_height = self.image.get_allocated_height()
+            if image_width > 1 and image_height > 1:
+                return image_width, image_height
+
+            window_width, window_height = self.default_window_size()
+            return (
+                max(1, window_width - IMAGE_HORIZONTAL_MARGIN),
+                max(1, window_height - IMAGE_VERTICAL_MARGIN),
+            )
 
         def scaled_pixbuf(self, path: Path) -> object:
             pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(path))
@@ -333,22 +390,7 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
             self.status.set_text(
                 f"Done. Remove {remove_count} of {len(refs)} image reference(s)?"
             )
-            self.path_label.set_text("Enter/y applies changes. u goes back. Esc/q cancels.")
-            self.image.clear()
-
-        def render_applied(
-            self, removed_lines: int, deleted_files: int, errors: list[str]
-        ) -> None:
-            self.finished = True
-            self.waiting = True
-            self.set_action_buttons(False)
-            self.status.set_text(
-                f"Applied. Removed {removed_lines} Markdown line(s), deleted {deleted_files} file(s)."
-            )
-            if errors:
-                self.path_label.set_text("Warnings: " + " | ".join(errors))
-            else:
-                self.path_label.set_text("Close the window.")
+            self.path_label.set_text("Enter/y applies changes and closes. u goes back. Esc/q cancels.")
             self.image.clear()
 
         def set_action_buttons(self, reviewing: bool) -> None:
@@ -356,7 +398,7 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
                 self.keep_button.set_label("k  keep")
                 self.keep_button.set_sensitive(True)
             else:
-                self.keep_button.set_label("Enter/y  apply")
+                self.keep_button.set_label("Enter/y  apply + close")
                 self.keep_button.set_sensitive(not self.waiting)
             self.remove_button.set_sensitive(reviewing)
             self.undo_button.set_sensitive(not self.waiting)
@@ -404,16 +446,17 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
         def apply(self) -> None:
             if self.waiting or not self.finished:
                 return
-            self.flash("#226b3a")
             try:
-                removed_lines, deleted_files, errors = commit_changes(
+                _removed_lines, _deleted_files, errors = commit_changes(
                     markdown_file, lines, refs, self.decisions
                 )
             except OSError as exc:
                 self.status.set_text("Could not apply changes.")
                 self.path_label.set_text(str(exc))
                 return
-            self.render_applied(removed_lines, deleted_files, errors)
+            for error in errors:
+                print(f"swipemdimgs warning: {error}", file=sys.stderr)
+            self.quit()
 
         def flash(self, color_text: str) -> None:
             css = f"#swipemdimgs-flash-bg {{ background-color: {color_text}; }}".encode()
@@ -452,11 +495,33 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
             return False
 
         def quit(self, *_args) -> None:
-            Gtk.main_quit()
+            application = self.window.get_application()
+            if application is not None:
+                application.quit()
+            else:
+                Gtk.main_quit()
 
-    app = SwipeWindow()
-    Gtk.main()
-    return app.exit_code
+    state: dict[str, object] = {}
+
+    def activate(application: Gtk.Application) -> None:
+        if Gdk.Display.get_default() is None:
+            print("no graphical display is available for the review window", file=sys.stderr)
+            state["exit_code"] = 1
+            application.quit()
+            return
+        state["window"] = SwipeWindow(application)
+
+    application = Gtk.Application(
+        application_id=APP_ID,
+        flags=Gio.ApplicationFlags.NON_UNIQUE,
+    )
+    application.connect("activate", activate)
+    application_exit_code = application.run([sys.argv[0]])
+
+    window = state.get("window")
+    if isinstance(window, SwipeWindow):
+        return window.exit_code
+    return int(state.get("exit_code", application_exit_code))
 
 
 def main() -> int:

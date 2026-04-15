@@ -228,6 +228,9 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
             self.window.connect("key-press-event", self.on_key_press)
 
             self.background = Gtk.EventBox()
+            self.background.set_name("swipemdimgs-flash-bg")
+            self.background.set_visible_window(True)
+            self.flash_provider = Gtk.CssProvider()
             self.window.add(self.background)
 
             self.outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -269,12 +272,19 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
             return button
 
         def max_image_size(self) -> tuple[int, int]:
-            screen = Gdk.Screen.get_default()
-            if screen is None:
+            display = Gdk.Display.get_default()
+            if display is None or display.get_n_monitors() == 0:
                 return 1000, 650
-            return max(320, int(screen.get_width() * 0.82)), max(
-                240, int(screen.get_height() * 0.70)
-            )
+
+            window = self.window.get_window()
+            monitor = display.get_monitor_at_window(window) if window else None
+            if monitor is None:
+                monitor = display.get_primary_monitor()
+            if monitor is None:
+                monitor = display.get_monitor(0)
+
+            workarea = monitor.get_workarea()
+            return max(320, int(workarea.width * 0.82)), max(240, int(workarea.height * 0.70))
 
         def scaled_pixbuf(self, path: Path) -> object:
             pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(path))
@@ -406,13 +416,15 @@ def run_gui(markdown_file: Path, lines: list[str], refs: list[ImageRef]) -> int:
             self.render_applied(removed_lines, deleted_files, errors)
 
         def flash(self, color_text: str) -> None:
-            color = Gdk.RGBA()
-            color.parse(color_text)
-            self.background.override_background_color(Gtk.StateFlags.NORMAL, color)
+            css = f"#swipemdimgs-flash-bg {{ background-color: {color_text}; }}".encode()
+            self.flash_provider.load_from_data(css)
+            self.background.get_style_context().add_provider(
+                self.flash_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
             GLib.timeout_add(FLASH_MS, self.reset_background)
 
         def reset_background(self) -> bool:
-            self.background.override_background_color(Gtk.StateFlags.NORMAL, None)
+            self.background.get_style_context().remove_provider(self.flash_provider)
             return False
 
         def on_key_press(self, _window, event) -> bool:
